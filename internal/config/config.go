@@ -43,32 +43,26 @@ var AuthAESKey = []byte{0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0x
 const AuthCTRInit uint64 = 0xFEFEFEFEFEFEFEFE
 
 type Config struct {
-	DeviceID      string `json:"device_id,omitempty"`
-	Phone         string `json:"phone,omitempty"`
-	Username      string `json:"username,omitempty"`
-	Password      string `json:"password,omitempty"`
-	SubAccount    string `json:"sub_account,omitempty"`
-	SubPassword   string `json:"sub_password,omitempty"`
-	LoginMode     string `json:"login_mode,omitempty"`
-	SohoToken     string `json:"soho_token,omitempty"`
-	UserID        string `json:"user_id,omitempty"`
-	UserServiceID string `json:"user_service_id,omitempty"`
-	VMID          string `json:"vm_id,omitempty"`
-}
-
-var configDir string
-
-func init() {
-	exe, err := os.Executable()
-	if err != nil {
-		configDir = "."
-	} else {
-		configDir = filepath.Dir(exe)
-	}
+	DeviceID       string     `json:"device_id,omitempty"`
+	Phone          string     `json:"phone,omitempty"`
+	Username       string     `json:"username,omitempty"`
+	Password       string     `json:"password,omitempty"`
+	SubAccount     string     `json:"sub_account,omitempty"`
+	SubPassword    string     `json:"sub_password,omitempty"`
+	SubPasswordBox *SecretBox `json:"sub_password_box,omitempty"`
+	LoginMode      string     `json:"login_mode,omitempty"`
+	SohoToken      string     `json:"soho_token,omitempty"`
+	UserID         string     `json:"user_id,omitempty"`
+	UserServiceID  string     `json:"user_service_id,omitempty"`
+	VMID           string     `json:"vm_id,omitempty"`
 }
 
 func ConfigFilePath() string {
-	return filepath.Join(configDir, "cloud_pc.json")
+	wd, err := os.Getwd()
+	if err != nil {
+		return "config.json"
+	}
+	return filepath.Join(wd, "config.json")
 }
 
 func LoadConfig() (*Config, error) {

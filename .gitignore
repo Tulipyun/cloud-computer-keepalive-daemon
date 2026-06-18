@@ -30,6 +30,7 @@ dist/
 
 # Runtime config
 cloud_pc.json
+config.json
 
 # env file
 .env

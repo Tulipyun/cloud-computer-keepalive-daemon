@@ -39,10 +39,16 @@ func Keepalive(args []string) {
 			duration = 0
 		}
 	}
+	if err := RunKeepalive(duration); err != nil {
+		logger.Errorf("Keepalive failed: %v", err)
+		os.Exit(1)
+	}
+}
 
+func RunKeepalive(duration int) error {
 	sohoToken, userID := soho.LoadSohoToken()
 	if sohoToken == "" {
-		os.Exit(1)
+		return fmt.Errorf("missing soho token")
 	}
 	logger.Infof("SohoToken: %s", logger.Mask(sohoToken, 4))
 
@@ -50,30 +56,23 @@ func Keepalive(args []string) {
 	// without an SCG auth code, matching the official Windows client flow.
 	firmAuth, err := cem.GetFirmAuth(sohoToken, userID)
 	if err != nil {
-		logger.Errorf("getFirmAuth failed: %v", err)
-		os.Exit(1)
+		return fmt.Errorf("getFirmAuth failed: %w", err)
 	}
 	firmAuthCode, _ := firmAuth["scAuthCode"].(string)
 	if firmAuthCode == "" {
-		if err := keepaliveZTE(firmAuth, sohoToken, userID, duration); err != nil {
-			logger.Errorf("ZTE keepalive failed: %v", err)
-			os.Exit(1)
-		}
-		return
+		return keepaliveZTE(firmAuth, sohoToken, userID, duration)
 	}
 
 	accessToken, err := cem.ExchangeCEMAccessToken(firmAuthCode)
 	if err != nil {
-		logger.Errorf("Get CEM access_token failed: %v", err)
-		os.Exit(1)
+		return fmt.Errorf("get CEM access_token failed: %w", err)
 	}
 
 	// 2. Call getConnectInfo to trigger VM boot
 	logger.Info("Calling getConnectInfo...")
 	connectInfo, err := cem.GetConnectInfo(accessToken)
 	if err != nil {
-		logger.Errorf("getConnectInfo failed: %v", err)
-		os.Exit(1)
+		return fmt.Errorf("getConnectInfo failed: %w", err)
 	}
 
 	logger.Infof("SCG: %s:%s, readyStatus=%.0f", connectInfo.ScgIP, connectInfo.ScgPort, connectInfo.ReadyStatus)
@@ -86,8 +85,7 @@ func Keepalive(args []string) {
 		logger.Info("Waiting for VM ready...")
 		readyInfo, err := cem.WaitVMReady(accessToken, connectInfo.TraceID)
 		if err != nil {
-			logger.Errorf("VM ready timeout: %v", err)
-			os.Exit(1)
+			return fmt.Errorf("VM ready timeout: %w", err)
 		}
 		if readyInfo.ScAuthCode != "" {
 			scAuthCode = readyInfo.ScAuthCode
@@ -100,12 +98,11 @@ func Keepalive(args []string) {
 	cfg, _ := config.LoadConfig()
 	tlsConn, _, err := scg.ConnectSCG(connectInfo.ScgIP, connectInfo.ScgPort, scAuthCode, cfg.VMID)
 	if err != nil {
-		logger.Errorf("Connect SCG failed: %v", err)
-		os.Exit(1)
+		return fmt.Errorf("connect SCG failed: %w", err)
 	}
 
 	// 5. Keepalive loop
-	keepaliveLoop(tlsConn, sohoToken, userID, duration)
+	return keepaliveLoop(tlsConn, sohoToken, userID, duration)
 }
 
 func keepaliveZTE(firmAuth map[string]any, sohoToken, userID string, duration int) error {
@@ -445,7 +442,7 @@ func keepaliveRawSpiceLoop(conn net.Conn, sohoToken, userID string, duration int
 	}
 }
 
-func keepaliveLoop(conn net.Conn, sohoToken, userID string, duration int) {
+func keepaliveLoop(conn net.Conn, sohoToken, userID string, duration int) error {
 	if duration > 0 {
 		logger.Infof("Keeping connection for %ds...", duration)
 	} else {
@@ -475,14 +472,14 @@ func keepaliveLoop(conn net.Conn, sohoToken, userID string, duration int) {
 		select {
 		case <-sigCh:
 			logger.Info("User interrupted")
-			return
+			return nil
 		default:
 		}
 
 		elapsed := int(time.Since(start).Seconds())
 		if duration > 0 && elapsed >= duration {
 			logger.Infof("Keepalive %ds done, disconnecting", elapsed)
-			return
+			return nil
 		}
 
 		// SOHO API heartbeat
@@ -570,7 +567,7 @@ func keepaliveLoop(conn net.Conn, sohoToken, userID string, duration int) {
 					// timeout is ok
 				} else {
 					logger.Error("SCG connection lost")
-					return
+					return fmt.Errorf("SCG connection lost: %w", err)
 				}
 			}
 			conn.SetReadDeadline(time.Time{})
