@@ -1,6 +1,6 @@
 # Local daemon keepalive status
 
-Last updated: 2026-06-18
+Last updated: 2026-07-14
 
 ## Branches
 
@@ -8,7 +8,7 @@ Last updated: 2026-06-18
 - Upstream PR commit: `5297445 Add subaccount ZTE keepalive`
 - Local daemon branch: `codex/local-daemon-keepalive`
 - Local daemon commit before this note: `a4275b5 Add local daemon keepalive workflow`
-- The local daemon branch is intentionally not pushed.
+- The local daemon branch is the source for the new private standalone repository.
 
 ## Upstream PR state
 
@@ -66,11 +66,11 @@ Last updated: 2026-06-18
 - Cross-compile targets built successfully with `CGO_ENABLED=0`.
 - Current local binaries:
   - `dist/cck-daemon-windows-amd64.exe`
-    - SHA256: `061A0B245592F602B30D9C6C4222443ED2A2B34F26BF13BBA83F97CF2EB763E2`
+    - SHA256: `0CCF9513F3A1DD750005094AAF6A127982AF10ECF438BB363C2C34A7169D8E62`
   - `dist/cck-daemon-windows-arm64.exe`
-    - SHA256: `557F9C89E3E1F9035365C350271E6D43086A154CAF20628D6CCAA87A8DACD13C`
+    - SHA256: `556461FAAD8B8283886CE92FACA8F134CB821287712E249E038A80A36173D5E3`
   - `dist/cck-daemon-linux-amd64`
-    - SHA256: `C4581F0BB7C54169B3D90AC5700C62064F25921FE9B4971460A93BDFA95423C8`
+    - SHA256: `406990360DA28E2620CCAB5D93BA65399CCBE012F4DCB517D175E9BC852601C6`
 
 ## Local files intentionally ignored
 
