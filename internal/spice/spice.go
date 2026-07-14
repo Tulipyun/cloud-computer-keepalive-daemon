@@ -196,7 +196,7 @@ func SpiceChannelAuth(conn net.Conn, sid uint64, channelID uint64, channelType u
 	return false
 }
 
-func connectSubChannels(conn net.Conn, sid uint64, spiceSessionID uint32) []uint64 {
+func connectSubChannels(conn net.Conn, sid uint64, spiceSessionID uint32) ([]uint64, bool) {
 	// Only connect display channel
 	type subCh struct {
 		channelID   uint64
@@ -319,13 +319,14 @@ func connectSubChannels(conn net.Conn, sid uint64, spiceSessionID uint32) []uint
 			break
 		}
 	}
+	displayReady := false
 	if hasDisplay {
 		displayInit := make([]byte, 20)
 		binary.LittleEndian.PutUint16(displayInit[0:2], 0x65)
 		binary.LittleEndian.PutUint32(displayInit[2:6], 14)
-		displayInit[6] = 1 // pixmap_cache_id
+		displayInit[6] = 1                                          // pixmap_cache_id
 		binary.LittleEndian.PutUint64(displayInit[7:15], 0x1400000) // pixmap_cache_size (i64)
-		displayInit[15] = 1 // glz_dictionary_id
+		displayInit[15] = 1                                         // glz_dictionary_id
 		binary.LittleEndian.PutUint32(displayInit[16:20], 0x7ffc00) // glz_dictionary_window_size (i32)
 
 		head := chuanyun.FrameHeadPack(DataType, uint16(len(displayInit)), sid, 2)
@@ -347,6 +348,7 @@ func connectSubChannels(conn net.Conn, sid uint64, spiceSessionID uint32) []uint
 			msgType := binary.LittleEndian.Uint16(frame.Payload[0:2])
 			if msgType == 0x66 { // MARK
 				logger.Info("  display: MARK received (Surface created)")
+				displayReady = true
 				break
 			}
 		}
@@ -370,13 +372,14 @@ func connectSubChannels(conn net.Conn, sid uint64, spiceSessionID uint32) []uint
 		}
 	}
 
-	return connected
+	return connected, displayReady
 }
 
 type HandshakeResult struct {
-	SessionID        uint64
-	SpiceSessionID   uint32
-	SpiceOK          bool
+	SessionID         uint64
+	SpiceSessionID    uint32
+	SpiceOK           bool
+	DisplayReady      bool
 	ConnectedChannels []uint64
 }
 
@@ -455,7 +458,7 @@ func SpiceHandshake(conn net.Conn) *HandshakeResult {
 	}
 
 	// 6. Connect sub-channels
-	connected := connectSubChannels(conn, sid, spiceSessionID)
+	connected, displayReady := connectSubChannels(conn, sid, spiceSessionID)
 	var names []string
 	for _, c := range connected {
 		name := chuanyun.ChannelNames[c]
@@ -467,9 +470,10 @@ func SpiceHandshake(conn net.Conn) *HandshakeResult {
 	logger.Infof("Sub-channels connected: %v", names)
 
 	return &HandshakeResult{
-		SessionID:        sid,
-		SpiceSessionID:   spiceSessionID,
-		SpiceOK:          true,
+		SessionID:         sid,
+		SpiceSessionID:    spiceSessionID,
+		SpiceOK:           displayReady,
+		DisplayReady:      displayReady,
 		ConnectedChannels: connected,
 	}
 }

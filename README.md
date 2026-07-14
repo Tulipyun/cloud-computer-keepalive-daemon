@@ -4,6 +4,8 @@
 
 本仓库是后续协议维护和无人值守运行的私有起点。协议状态、关键结论和升级入口另见 [LOCAL_DAEMON_STATUS.md](LOCAL_DAEMON_STATUS.md)。
 
+当前开发中的协议硬化版本见 [V0.2_HARDENING.md](V0.2_HARDENING.md)。已发布的 `v0.1.0` 保持冻结，可随时作为回退基线。
+
 ## 当前能力
 
 - 子账号密码登录，不依赖主账号手机号。

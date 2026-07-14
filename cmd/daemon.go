@@ -8,7 +8,9 @@ import (
 	"cloud-computer-keepalive/internal/soho"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -26,7 +28,7 @@ func RunDaemon() {
 		os.Exit(1)
 	}
 
-	backoff := 5 * time.Second
+	failures := make(map[failureKind]int)
 	for {
 		started := time.Now()
 		err := RunKeepalive(0)
@@ -34,20 +36,51 @@ func RunDaemon() {
 			return
 		}
 		if time.Since(started) > 10*time.Minute {
-			backoff = 5 * time.Second
+			clear(failures)
 		}
-		logger.Warnf("Keepalive stopped: %v", err)
+		decision := classifyKeepaliveError(err)
+		failures[decision.kind]++
+		logger.Warnf("Keepalive stopped: kind=%s consecutive=%d reason=%s error=%v",
+			decision.kind, failures[decision.kind], decision.description, err)
+		if decision.fatal {
+			logger.Errorf("Automatic retry stopped: %s", decision.description)
+			return
+		}
 
-		if err := ensureLocalConfig(scanner, cfg, true); err != nil {
-			logger.Warnf("Refresh login failed: %v", err)
+		if decision.relogin {
+			if loginErr := ensureLocalConfig(scanner, cfg, true); loginErr != nil {
+				loginDecision := classifyKeepaliveError(loginErr)
+				failures[loginDecision.kind]++
+				logger.Warnf("Refresh login failed: kind=%s error=%v", loginDecision.kind, loginErr)
+				decision = loginDecision
+				if decision.fatal {
+					return
+				}
+			} else {
+				failures[failureAuth] = 0
+			}
 		}
 
-		logger.Infof("Retrying in %s...", backoff)
-		time.Sleep(backoff)
-		backoff *= 2
-		if backoff > 5*time.Minute {
-			backoff = 5 * time.Minute
+		delay := retryDelay(decision, failures[decision.kind])
+		logger.Infof("Retrying in %s (kind=%s)...", delay.Round(time.Second), decision.kind)
+		if !waitForRetry(delay) {
+			logger.Info("User interrupted during retry wait")
+			return
 		}
+	}
+}
+
+func waitForRetry(delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	select {
+	case <-timer.C:
+		return true
+	case <-sigCh:
+		return false
 	}
 }
 
@@ -164,7 +197,18 @@ func fetchLocalCloudPC(scanner *bufio.Scanner, cfg *config.Config) error {
 	}
 
 	idx := 0
-	if len(listRaw) > 1 {
+	selectedExisting := false
+	if cfg.UserServiceID != "" {
+		for i, item := range listRaw {
+			pc, _ := item.(map[string]any)
+			if jsonString(pc["userServiceId"]) == cfg.UserServiceID {
+				idx = i
+				selectedExisting = true
+				break
+			}
+		}
+	}
+	if len(listRaw) > 1 && !selectedExisting {
 		fmt.Printf("Found %d cloud PCs:\n", len(listRaw))
 		for i, item := range listRaw {
 			pc, _ := item.(map[string]any)
@@ -177,6 +221,8 @@ func fetchLocalCloudPC(scanner *bufio.Scanner, cfg *config.Config) error {
 		if idx < 0 || idx >= len(listRaw) {
 			idx = 0
 		}
+	} else if selectedExisting {
+		logger.Infof("Reusing configured cloud PC userServiceId=%s", cfg.UserServiceID)
 	}
 
 	selectedPC, _ := listRaw[idx].(map[string]any)

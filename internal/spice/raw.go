@@ -23,9 +23,26 @@ var lastRawSerial uint32
 var lastRawSuffix []byte
 
 type RawState struct {
-	LastSerial uint32
-	LastSuffix []byte
-	NextSerial uint32
+	LastSerial     uint32
+	LastSuffix     []byte
+	NextSerial     uint32
+	AckGeneration  uint32
+	AckWindow      uint32
+	AckPending     uint32
+	Messages       uint64
+	LastMessageAt  time.Time
+	SetAckReceived bool
+	AckSyncSent    bool
+	AckSent        uint64
+	PingReceived   bool
+	PongSent       bool
+	SurfaceCreated bool
+	DrawReceived   bool
+	MarkReceived   bool
+}
+
+func (s *RawState) DisplayReady() bool {
+	return s.MarkReceived || s.SurfaceCreated || s.DrawReceived
 }
 
 func RawMainHandshake(conn net.Conn, key, vmid string, linkUUID []byte, traceID, spanID string) *RawHandshakeResult {
@@ -393,6 +410,8 @@ func (s *RawState) ReadMessage(conn net.Conn, timeout time.Duration) (uint16, []
 			s.LastSuffix = t.TakeReadBufferN(5)
 		}
 	}
+	s.Messages++
+	s.LastMessageAt = time.Now()
 	return msgType, payload, nil
 }
 
@@ -405,35 +424,82 @@ func RawAutoReply(conn net.Conn, msgType uint16, payload []byte) bool {
 }
 
 func (s *RawState) AutoReply(conn net.Conn, msgType uint16, payload []byte) bool {
+	replied, _ := s.HandleMessage(conn, msgType, payload)
+	return replied
+}
+
+func (s *RawState) HandleMessage(conn net.Conn, msgType uint16, payload []byte) (bool, error) {
+	s.observeDisplayMessage(msgType)
+	replied := false
 	switch msgType {
 	case 0x04:
+		s.PingReceived = true
 		pong := make([]byte, 6+len(payload))
 		binary.LittleEndian.PutUint16(pong[0:2], 0x03)
 		binary.LittleEndian.PutUint32(pong[2:6], uint32(len(payload)))
 		copy(pong[6:], payload)
-		_, _ = s.WriteMessage(conn, s.LastSerial, pong)
-		return true
+		if _, err := s.WriteMessage(conn, s.LastSerial, pong); err != nil {
+			return false, fmt.Errorf("send SPICE PONG: %w", err)
+		}
+		s.PongSent = true
+		replied = true
 	case 0x03:
 		var generation uint32
+		var window uint32
 		if len(payload) >= 4 {
 			generation = binary.LittleEndian.Uint32(payload[:4])
 		}
+		if len(payload) >= 8 {
+			window = binary.LittleEndian.Uint32(payload[4:8])
+		}
+		s.AckGeneration = generation
+		s.AckWindow = window
+		s.AckPending = 0
+		s.SetAckReceived = true
 		ack := make([]byte, 10)
 		binary.LittleEndian.PutUint16(ack[0:2], 0x01)
 		binary.LittleEndian.PutUint32(ack[2:6], 4)
 		binary.LittleEndian.PutUint32(ack[6:10], generation)
-		_, _ = s.WriteMessage(conn, s.LastSerial, ack)
-		return true
+		if _, err := s.WriteMessage(conn, s.LastSerial, ack); err != nil {
+			return false, fmt.Errorf("send SPICE ACK_SYNC: %w", err)
+		}
+		s.AckSyncSent = true
+		return true, nil
 	case 0x74:
 		reply := make([]byte, 7)
 		binary.LittleEndian.PutUint16(reply[0:2], 0x79)
 		binary.LittleEndian.PutUint32(reply[2:6], 1)
-		if _, err := s.WriteMessage(conn, s.nextSerial(), reply); err == nil {
-			return true
+		if _, err := s.WriteMessage(conn, s.nextSerial(), reply); err != nil {
+			return false, fmt.Errorf("send ZTE SPICE 0x79 reply: %w", err)
 		}
-		return false
+		replied = true
 	}
-	return false
+
+	if msgType != 0x03 && s.AckWindow > 0 {
+		s.AckPending++
+		if s.AckPending >= s.AckWindow {
+			ack := make([]byte, 6)
+			binary.LittleEndian.PutUint16(ack[0:2], 0x02)
+			if _, err := s.WriteMessage(conn, s.LastSerial, ack); err != nil {
+				return replied, fmt.Errorf("send SPICE ACK: %w", err)
+			}
+			s.AckPending = 0
+			s.AckSent++
+			replied = true
+		}
+	}
+	return replied, nil
+}
+
+func (s *RawState) observeDisplayMessage(msgType uint16) {
+	switch msgType {
+	case 0x66:
+		s.MarkReceived = true
+	case 0x130:
+		s.DrawReceived = true
+	case 0x13a:
+		s.SurfaceCreated = true
+	}
 }
 
 func (s *RawState) WriteMessage(conn net.Conn, serial uint32, msg []byte) (int, error) {

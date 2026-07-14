@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -219,8 +220,8 @@ func keepaliveZTESession(firmAuth map[string]any, sohoToken, userID string, dura
 	if err != nil {
 		logger.Warnf("ZTE subchannel REDQ probe failed: %v", err)
 	}
-	startZTESubchannelKeepalive(subLinks, authed)
-	return keepaliveRawSpiceLoop(proxyConn, sohoToken, userID, duration)
+	health := startZTESubchannelKeepalive(subLinks, authed)
+	return keepaliveRawSpiceLoop(proxyConn, sohoToken, userID, duration, health)
 }
 
 func sendZTESubchannelREDQs(ctx context.Context, mux *zte.CAGMux, params *zte.ConnectParams, main *zte.CAGMuxLink, connectionID uint32) (map[byte]*zte.CAGMuxLink, map[byte]bool, error) {
@@ -334,7 +335,100 @@ func authenticateZTESubchannels(links map[byte]*zte.CAGMuxLink, timeout time.Dur
 	return done
 }
 
-func startZTESubchannelKeepalive(links map[byte]*zte.CAGMuxLink, authed map[byte]bool) {
+type zteDisplayHealth struct {
+	initSent bool
+	messages uint64
+	mark     bool
+	surface  bool
+	draw     bool
+	closed   bool
+}
+
+type zteSessionHealth struct {
+	mu       sync.Mutex
+	displays map[byte]*zteDisplayHealth
+	errCh    chan error
+}
+
+func newZTESessionHealth(authed map[byte]bool) *zteSessionHealth {
+	h := &zteSessionHealth{
+		displays: make(map[byte]*zteDisplayHealth),
+		errCh:    make(chan error, 1),
+	}
+	for _, linkID := range []byte{5, 7} {
+		if authed[linkID] {
+			h.displays[linkID] = &zteDisplayHealth{}
+		}
+	}
+	return h
+}
+
+func (h *zteSessionHealth) markDisplayInit(linkID byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if display := h.displays[linkID]; display != nil {
+		display.initSent = true
+	}
+}
+
+func (h *zteSessionHealth) observe(linkID byte, state *spice.RawState) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if display := h.displays[linkID]; display != nil {
+		display.messages = state.Messages
+		display.mark = state.MarkReceived
+		display.surface = state.SurfaceCreated
+		display.draw = state.DrawReceived
+	}
+}
+
+func (h *zteSessionHealth) linkClosed(linkID byte, err error) {
+	h.mu.Lock()
+	display := h.displays[linkID]
+	if display == nil {
+		h.mu.Unlock()
+		return
+	}
+	display.closed = true
+	allClosed := true
+	for _, item := range h.displays {
+		if !item.closed {
+			allClosed = false
+			break
+		}
+	}
+	h.mu.Unlock()
+	if allClosed {
+		select {
+		case h.errCh <- fmt.Errorf("all ZTE display channels closed: %w", err):
+		default:
+		}
+	}
+}
+
+func (h *zteSessionHealth) ready() (bool, string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for linkID, display := range h.displays {
+		if !display.initSent {
+			continue
+		}
+		if display.mark || display.surface || display.draw {
+			return true, fmt.Sprintf("link=%d mark=%v surface=%v draw=%v messages=%d",
+				linkID, display.mark, display.surface, display.draw, display.messages)
+		}
+	}
+	return false, ""
+}
+
+func (h *zteSessionHealth) displayCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.displays)
+}
+
+func startZTESubchannelKeepalive(links map[byte]*zte.CAGMuxLink, authed map[byte]bool) *zteSessionHealth {
+	health := newZTESessionHealth(authed)
 	for linkID, link := range links {
 		if !authed[linkID] {
 			continue
@@ -349,15 +443,18 @@ func startZTESubchannelKeepalive(links map[byte]*zte.CAGMuxLink, authed map[byte
 		case 5, 7:
 			if _, err := spice.WriteRawMessage(link, 1, spice.BuildZTERawDisplayInit()); err != nil {
 				logger.Warnf("ZTE display init failed on link=%d: %v", linkID, err)
+				health.linkClosed(linkID, err)
 			} else {
+				health.markDisplayInit(linkID)
 				logger.Debugf("ZTE display init sent on link=%d", linkID)
 			}
 		}
-		go keepZTESubchannelAlive(linkID, link)
+		go keepZTESubchannelAlive(linkID, link, health)
 	}
+	return health
 }
 
-func keepZTESubchannelAlive(linkID byte, link *zte.CAGMuxLink) {
+func keepZTESubchannelAlive(linkID byte, link *zte.CAGMuxLink, health *zteSessionHealth) {
 	state := &spice.RawState{}
 	for {
 		msgType, payload, err := state.ReadMessage(link, 30*time.Second)
@@ -368,16 +465,24 @@ func keepZTESubchannelAlive(linkID byte, link *zte.CAGMuxLink) {
 			if err != io.EOF {
 				logger.Debugf("ZTE subchannel link=%d stopped: %v", linkID, err)
 			}
+			health.linkClosed(linkID, err)
 			return
 		}
 		logger.Debugf("ZTE subchannel link=%d recv msg=0x%02x len=%d", linkID, msgType, len(payload))
-		if state.AutoReply(link, msgType, payload) {
+		replied, replyErr := state.HandleMessage(link, msgType, payload)
+		health.observe(linkID, state)
+		if replyErr != nil {
+			logger.Debugf("ZTE subchannel link=%d reply failed: %v", linkID, replyErr)
+			health.linkClosed(linkID, replyErr)
+			return
+		}
+		if replied {
 			logger.Debugf("ZTE subchannel link=%d auto-reply msg=0x%02x", linkID, msgType)
 		}
 	}
 }
 
-func keepaliveRawSpiceLoop(conn net.Conn, sohoToken, userID string, duration int) error {
+func keepaliveRawSpiceLoop(conn net.Conn, sohoToken, userID string, duration int, health *zteSessionHealth) error {
 	if duration > 0 {
 		logger.Infof("Keeping raw SPICE connection for %ds...", duration)
 	} else {
@@ -386,10 +491,18 @@ func keepaliveRawSpiceLoop(conn net.Conn, sohoToken, userID string, duration int
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	start := time.Now()
 	heartbeatCount := 0
+	heartbeatFailures := 0
 	rawState := &spice.RawState{}
 	nextHeartbeat := start
+	readinessDeadline := start.Add(30 * time.Second)
+	displayReady := false
+	if health == nil || health.displayCount() == 0 {
+		return fmt.Errorf("ZTE session has no authenticated display channel")
+	}
+	logger.Info("Waiting for ZTE display surface evidence...")
 
 	defer func() {
 		conn.Close()
@@ -411,16 +524,28 @@ func keepaliveRawSpiceLoop(conn net.Conn, sohoToken, userID string, duration int
 		}
 
 		now := time.Now()
+		if !displayReady {
+			if ready, evidence := health.ready(); ready {
+				displayReady = true
+				logger.Infof("ZTE display session ready: %s", evidence)
+			} else if now.After(readinessDeadline) {
+				return fmt.Errorf("ZTE display readiness timeout: no MARK, SURFACE_CREATE, or DRAW_COPY after DISPLAY_INIT")
+			}
+		}
+		select {
+		case healthErr := <-health.errCh:
+			return healthErr
+		default:
+		}
 		if !now.Before(nextHeartbeat) {
-			cfg, _ := config.LoadConfig()
-			if cfg.UserServiceID != "" {
-				bodyJSON := fmt.Sprintf(`{"userServiceId":"%s"}`, cfg.UserServiceID)
-				bodyData, err := crypto.RSAEncrypt(bodyJSON)
-				if err == nil {
-					if _, err = soho.SohoRequest("/cc/cloudPc/heartbeat/v2", bodyData, sohoToken, userID); err != nil {
-						logger.Warnf("Heartbeat error: %v", err)
-					}
+			if err := sendSohoHeartbeat(sohoToken, userID); err != nil {
+				heartbeatFailures++
+				logger.Warnf("Heartbeat error (%d/3): %v", heartbeatFailures, err)
+				if heartbeatFailures >= 3 {
+					return fmt.Errorf("SOHO heartbeat failed %d consecutive times: %w", heartbeatFailures, err)
 				}
+			} else {
+				heartbeatFailures = 0
 			}
 			heartbeatCount++
 			logger.Infof("Raw SPICE heartbeat #%d (uptime=%ds)", heartbeatCount, elapsed)
@@ -433,10 +558,17 @@ func keepaliveRawSpiceLoop(conn net.Conn, sohoToken, userID string, duration int
 				logger.Info("Raw SPICE server closed connection")
 				return fmt.Errorf("raw SPICE server closed connection")
 			}
-			continue
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return fmt.Errorf("raw SPICE main read failed: %w", err)
 		}
 		logger.Debugf("Raw SPICE loop recv msg=0x%02x len=%d", msgType, len(payload))
-		if rawState.AutoReply(conn, msgType, payload) {
+		replied, replyErr := rawState.HandleMessage(conn, msgType, payload)
+		if replyErr != nil {
+			return replyErr
+		}
+		if replied {
 			logger.Debugf("Raw SPICE auto-reply msg=0x%02x", msgType)
 		}
 	}
@@ -451,17 +583,24 @@ func keepaliveLoop(conn net.Conn, sohoToken, userID string, duration int) error 
 
 	// SPICE handshake
 	result := spice.SpiceHandshake(conn)
-	logger.Infof("Handshake result: spice=%v channels=%v", result.SpiceOK, result.ConnectedChannels)
+	logger.Infof("Handshake result: spice=%v displayReady=%v channels=%v", result.SpiceOK, result.DisplayReady, result.ConnectedChannels)
 	logger.Debugf("sid=0x%x spice_sid=0x%x", result.SessionID, result.SpiceSessionID)
+	if !result.SpiceOK || !result.DisplayReady {
+		return fmt.Errorf("SCG SPICE display session did not reach MARK/Surface readiness")
+	}
 
 	sid := result.SessionID
 
 	// Signal handling
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	start := time.Now()
 	heartbeatCount := 0
+	heartbeatFailures := 0
+	ackStates := make(map[uint64]*scgAckState)
+	nextHeartbeat := start
 
 	defer func() {
 		conn.Close()
@@ -482,99 +621,126 @@ func keepaliveLoop(conn net.Conn, sohoToken, userID string, duration int) error 
 			return nil
 		}
 
-		// SOHO API heartbeat
-		cfg, _ := config.LoadConfig()
-		if cfg.UserServiceID != "" {
-			bodyJSON := fmt.Sprintf(`{"userServiceId":"%s"}`, cfg.UserServiceID)
-			bodyData, err := crypto.RSAEncrypt(bodyJSON)
-			if err == nil {
-				_, err = soho.SohoRequest("/cc/cloudPc/heartbeat/v2", bodyData, sohoToken, userID)
-				if err != nil {
-					logger.Warnf("Heartbeat error: %v", err)
+		now := time.Now()
+		if !now.Before(nextHeartbeat) {
+			if err := sendSohoHeartbeat(sohoToken, userID); err != nil {
+				heartbeatFailures++
+				logger.Warnf("Heartbeat error (%d/3): %v", heartbeatFailures, err)
+				if heartbeatFailures >= 3 {
+					return fmt.Errorf("SOHO heartbeat failed %d consecutive times: %w", heartbeatFailures, err)
 				}
+			} else {
+				heartbeatFailures = 0
 			}
-		}
-		heartbeatCount++
+			heartbeatCount++
 
-		// Send MOUSE_MODE_REQUEST on main channel
-		if result.SpiceOK {
 			mouseMode := make([]byte, 10)
 			binary.LittleEndian.PutUint16(mouseMode[0:2], 0x69)
 			binary.LittleEndian.PutUint32(mouseMode[2:6], 4)
 			binary.LittleEndian.PutUint32(mouseMode[6:10], 2)
 			head := chuanyun.FrameHeadPack(spice.DataType, uint16(len(mouseMode)), sid, 1)
-			conn.Write(append(head, mouseMode...))
+			if _, err := conn.Write(append(head, mouseMode...)); err != nil {
+				return fmt.Errorf("send SCG mouse mode keepalive: %w", err)
+			}
+
+			logger.Infof("Heartbeat #%d (uptime=%ds, spice=%v, channels=%v)",
+				heartbeatCount, elapsed, result.SpiceOK, result.ConnectedChannels)
+			nextHeartbeat = now.Add(25 * time.Second)
 		}
 
-		logger.Infof("Heartbeat #%d (uptime=%ds, spice=%v, channels=%v)",
-			heartbeatCount, elapsed, result.SpiceOK, result.ConnectedChannels)
-
-		// Consume and parse server data
-		frames := chuanyun.RecvAllFrames(conn, 1*time.Second, 10)
-		for _, frame := range frames {
-			if frame.PktType == chuanyun.TrunkSwitch && len(frame.Payload) >= 32 {
-				targetCID := binary.LittleEndian.Uint64(frame.Payload[0:8])
-				_ = targetCID
-				senderCID := binary.LittleEndian.Uint64(frame.Payload[8:16])
-				param := binary.LittleEndian.Uint32(frame.Payload[16:20])
-				switchReason := frame.Payload[20]
-				extraID := binary.LittleEndian.Uint64(frame.Payload[24:32])
-				resp := chuanyun.TrunkSwitchPack(senderCID, sid, param, switchReason, extraID, frame.Field1, frame.Field2)
-				conn.Write(resp)
-				logger.Debugf("Switch reply: reason=%d", switchReason)
+		frame, err := chuanyun.RecvTrunkFrame(conn, time.Second)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
-
-			if frame.PktType == spice.DataType && len(frame.Payload) >= 6 {
-				msgType := binary.LittleEndian.Uint16(frame.Payload[0:2])
-				chName := chuanyun.ChannelNames[frame.Field2]
-				if chName == "" {
-					chName = fmt.Sprintf("ch%d", frame.Field2)
-				}
-
-				if msgType == 0x04 { // PING -> PONG
-					pingData := frame.Payload[6:]
-					pong := make([]byte, 6+len(pingData))
-					binary.LittleEndian.PutUint16(pong[0:2], 0x03)
-					binary.LittleEndian.PutUint32(pong[2:6], uint32(len(pingData)))
-					copy(pong[6:], pingData)
-					head := chuanyun.FrameHeadPack(spice.DataType, uint16(len(pong)), sid, frame.Field2)
-					conn.Write(append(head, pong...))
-					logger.Debugf("PING -> PONG (ch=%s)", chName)
-				} else if msgType == 0x03 { // SET_ACK -> ACK_SYNC
-					var generation uint32
-					if len(frame.Payload) >= 10 {
-						generation = binary.LittleEndian.Uint32(frame.Payload[6:10])
-					}
-					ackSync := make([]byte, 10)
-					binary.LittleEndian.PutUint16(ackSync[0:2], 0x01)
-					binary.LittleEndian.PutUint32(ackSync[2:6], 4)
-					binary.LittleEndian.PutUint32(ackSync[6:10], generation)
-					head := chuanyun.FrameHeadPack(spice.DataType, uint16(len(ackSync)), sid, frame.Field2)
-					conn.Write(append(head, ackSync...))
-					logger.Debugf("SET_ACK -> ACK_SYNC (gen=%d, ch=%s)", generation, chName)
-				}
-			}
+			return fmt.Errorf("SCG connection read failed: %w", err)
 		}
-
-		// Connection probe
-		if len(frames) == 0 {
-			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-			probe := make([]byte, 1)
-			_, err := conn.Read(probe)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					// timeout is ok
-				} else {
-					logger.Error("SCG connection lost")
-					return fmt.Errorf("SCG connection lost: %w", err)
-				}
-			}
-			conn.SetReadDeadline(time.Time{})
+		if err := handleSCGFrame(conn, sid, frame, ackStates); err != nil {
+			return err
 		}
-
-		time.Sleep(25 * time.Second)
 	}
+}
+
+type scgAckState struct {
+	window  uint32
+	pending uint32
+}
+
+func handleSCGFrame(conn net.Conn, sid uint64, frame *chuanyun.Frame, ackStates map[uint64]*scgAckState) error {
+	if frame.PktType == chuanyun.TrunkSwitch && len(frame.Payload) >= 32 {
+		senderCID := binary.LittleEndian.Uint64(frame.Payload[8:16])
+		param := binary.LittleEndian.Uint32(frame.Payload[16:20])
+		switchReason := frame.Payload[20]
+		extraID := binary.LittleEndian.Uint64(frame.Payload[24:32])
+		resp := chuanyun.TrunkSwitchPack(senderCID, sid, param, switchReason, extraID, frame.Field1, frame.Field2)
+		if _, err := conn.Write(resp); err != nil {
+			return fmt.Errorf("send SCG trunk switch reply: %w", err)
+		}
+		logger.Debugf("Switch reply: reason=%d", switchReason)
+		return nil
+	}
+	if frame.PktType != spice.DataType || len(frame.Payload) < 6 {
+		return nil
+	}
+
+	msgType := binary.LittleEndian.Uint16(frame.Payload[0:2])
+	chName := chuanyun.ChannelNames[frame.Field2]
+	if chName == "" {
+		chName = fmt.Sprintf("ch%d", frame.Field2)
+	}
+	state := ackStates[frame.Field2]
+	if state == nil {
+		state = &scgAckState{}
+		ackStates[frame.Field2] = state
+	}
+
+	switch msgType {
+	case 0x04:
+		pingData := frame.Payload[6:]
+		pong := make([]byte, 6+len(pingData))
+		binary.LittleEndian.PutUint16(pong[0:2], 0x03)
+		binary.LittleEndian.PutUint32(pong[2:6], uint32(len(pingData)))
+		copy(pong[6:], pingData)
+		head := chuanyun.FrameHeadPack(spice.DataType, uint16(len(pong)), sid, frame.Field2)
+		if _, err := conn.Write(append(head, pong...)); err != nil {
+			return fmt.Errorf("send SCG PONG on %s: %w", chName, err)
+		}
+		logger.Debugf("PING -> PONG (ch=%s)", chName)
+	case 0x03:
+		var generation uint32
+		if len(frame.Payload) >= 10 {
+			generation = binary.LittleEndian.Uint32(frame.Payload[6:10])
+		}
+		if len(frame.Payload) >= 14 {
+			state.window = binary.LittleEndian.Uint32(frame.Payload[10:14])
+		}
+		state.pending = 0
+		ackSync := make([]byte, 10)
+		binary.LittleEndian.PutUint16(ackSync[0:2], 0x01)
+		binary.LittleEndian.PutUint32(ackSync[2:6], 4)
+		binary.LittleEndian.PutUint32(ackSync[6:10], generation)
+		head := chuanyun.FrameHeadPack(spice.DataType, uint16(len(ackSync)), sid, frame.Field2)
+		if _, err := conn.Write(append(head, ackSync...)); err != nil {
+			return fmt.Errorf("send SCG ACK_SYNC on %s: %w", chName, err)
+		}
+		logger.Debugf("SET_ACK -> ACK_SYNC (gen=%d, window=%d, ch=%s)", generation, state.window, chName)
+		return nil
+	}
+
+	if state.window > 0 {
+		state.pending++
+		if state.pending >= state.window {
+			ack := make([]byte, 6)
+			binary.LittleEndian.PutUint16(ack[0:2], 0x02)
+			head := chuanyun.FrameHeadPack(spice.DataType, uint16(len(ack)), sid, frame.Field2)
+			if _, err := conn.Write(append(head, ack...)); err != nil {
+				return fmt.Errorf("send SCG ACK on %s: %w", chName, err)
+			}
+			state.pending = 0
+			logger.Debugf("ACK sent (window=%d, ch=%s)", state.window, chName)
+		}
+	}
+	return nil
 }
 
 func sendSohoCloudPCAction(path, sohoToken, userID string) error {
@@ -599,6 +765,30 @@ func sendSohoCloudPCAction(path, sohoToken, userID string) error {
 	code, _ := result["code"].(float64)
 	if code != 2000 && code != 4041 {
 		return fmt.Errorf("code=%v, msg=%v", result["code"], result["msg"])
+	}
+	return nil
+}
+
+func sendSohoHeartbeat(sohoToken, userID string) error {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("load config for heartbeat: %w", err)
+	}
+	if cfg.UserServiceID == "" {
+		return fmt.Errorf("missing user_service_id for heartbeat")
+	}
+	bodyJSON := fmt.Sprintf(`{"userServiceId":"%s"}`, cfg.UserServiceID)
+	bodyData, err := crypto.RSAEncrypt(bodyJSON)
+	if err != nil {
+		return fmt.Errorf("encrypt heartbeat: %w", err)
+	}
+	result, err := soho.SohoRequest("/cc/cloudPc/heartbeat/v2", bodyData, sohoToken, userID)
+	if err != nil {
+		return err
+	}
+	code := jsonString(result["code"])
+	if code != "2000" && code != "4041" {
+		return fmt.Errorf("heartbeat rejected: code=%s msg=%v", code, result["msg"])
 	}
 	return nil
 }
