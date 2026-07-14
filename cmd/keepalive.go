@@ -6,6 +6,7 @@ import (
 	"cloud-computer-keepalive/internal/chuanyun"
 	"cloud-computer-keepalive/internal/config"
 	"cloud-computer-keepalive/internal/crypto"
+	"cloud-computer-keepalive/internal/diagnostics"
 	"cloud-computer-keepalive/internal/logger"
 	"cloud-computer-keepalive/internal/scg"
 	"cloud-computer-keepalive/internal/soho"
@@ -47,6 +48,7 @@ func Keepalive(args []string) {
 }
 
 func RunKeepalive(duration int) error {
+	diagnostics.Event("keepalive_attempt_started", map[string]any{"durationSeconds": duration})
 	sohoToken, userID := soho.LoadSohoToken()
 	if sohoToken == "" {
 		return fmt.Errorf("missing soho token")
@@ -61,8 +63,10 @@ func RunKeepalive(duration int) error {
 	}
 	firmAuthCode, _ := firmAuth["scAuthCode"].(string)
 	if firmAuthCode == "" {
+		diagnostics.Event("route_selected", map[string]any{"route": "zte"})
 		return keepaliveZTE(firmAuth, sohoToken, userID, duration)
 	}
+	diagnostics.Event("route_selected", map[string]any{"route": "scg"})
 
 	accessToken, err := cem.ExchangeCEMAccessToken(firmAuthCode)
 	if err != nil {
@@ -185,6 +189,7 @@ func keepaliveZTESession(firmAuth map[string]any, sohoToken, userID string, dura
 	defer cancel()
 	cagAddr := fmt.Sprintf("%s:%d", firm.CAGIP, firm.CAGPort)
 	logger.Infof("Connecting ZTE CAG %s...", cagAddr)
+	diagnostics.Event("zte_cag_dial", map[string]any{"transport": "tcp_tls", "address": cagAddr})
 	tlsConn, session, err := zte.DialCAGTCPTLS(ctx, zte.CAGDialOptions{
 		Address:         cagAddr,
 		Params:          params,
@@ -193,6 +198,7 @@ func keepaliveZTESession(firmAuth map[string]any, sohoToken, userID string, dura
 	})
 	if err != nil {
 		logger.Warnf("ZTE CAG TCP/TLS failed, trying UDP/KCP path: %v", err)
+		diagnostics.Event("zte_cag_fallback", map[string]any{"from": "tcp_tls", "to": "udp_kcp_tls", "error": err.Error()})
 		tlsConn, session, err = zte.DialCAGTLS(ctx, zte.CAGDialOptions{
 			Address:         cagAddr,
 			Params:          params,
@@ -427,6 +433,23 @@ func (h *zteSessionHealth) displayCount() int {
 	return len(h.displays)
 }
 
+func (h *zteSessionHealth) snapshot() map[string]any {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	displays := make(map[string]any, len(h.displays))
+	for linkID, display := range h.displays {
+		displays[fmt.Sprintf("link-%d", linkID)] = map[string]any{
+			"initSent": display.initSent,
+			"messages": display.messages,
+			"mark":     display.mark,
+			"surface":  display.surface,
+			"draw":     display.draw,
+			"closed":   display.closed,
+		}
+	}
+	return map[string]any{"displays": displays}
+}
+
 func startZTESubchannelKeepalive(links map[byte]*zte.CAGMuxLink, authed map[byte]bool) *zteSessionHealth {
 	health := newZTESessionHealth(authed)
 	for linkID, link := range links {
@@ -435,13 +458,17 @@ func startZTESubchannelKeepalive(links map[byte]*zte.CAGMuxLink, authed map[byte
 		}
 		switch linkID {
 		case 6:
-			if _, err := spice.WriteRawMessage(link, 1, spice.BuildZTERawInputInit()); err != nil {
+			message := spice.BuildZTERawInputInit()
+			diagnostics.Packet("tx", "zte-raw-spice", fmt.Sprintf("link-%d", linkID), 0x67, message[6:])
+			if _, err := spice.WriteRawMessage(link, 1, message); err != nil {
 				logger.Warnf("ZTE input init failed on link=%d: %v", linkID, err)
 			} else {
 				logger.Debugf("ZTE input init sent on link=%d", linkID)
 			}
 		case 5, 7:
-			if _, err := spice.WriteRawMessage(link, 1, spice.BuildZTERawDisplayInit()); err != nil {
+			message := spice.BuildZTERawDisplayInit()
+			diagnostics.Packet("tx", "zte-raw-spice", fmt.Sprintf("link-%d", linkID), 0x65, message[6:])
+			if _, err := spice.WriteRawMessage(link, 1, message); err != nil {
 				logger.Warnf("ZTE display init failed on link=%d: %v", linkID, err)
 				health.linkClosed(linkID, err)
 			} else {
@@ -455,7 +482,7 @@ func startZTESubchannelKeepalive(links map[byte]*zte.CAGMuxLink, authed map[byte
 }
 
 func keepZTESubchannelAlive(linkID byte, link *zte.CAGMuxLink, health *zteSessionHealth) {
-	state := &spice.RawState{}
+	state := &spice.RawState{TraceChannel: fmt.Sprintf("link-%d", linkID)}
 	for {
 		msgType, payload, err := state.ReadMessage(link, 30*time.Second)
 		if err != nil {
@@ -495,8 +522,9 @@ func keepaliveRawSpiceLoop(conn net.Conn, sohoToken, userID string, duration int
 	start := time.Now()
 	heartbeatCount := 0
 	heartbeatFailures := 0
-	rawState := &spice.RawState{}
+	rawState := &spice.RawState{TraceChannel: "main"}
 	nextHeartbeat := start
+	nextHealthSnapshot := start
 	readinessDeadline := start.Add(30 * time.Second)
 	displayReady := false
 	if health == nil || health.displayCount() == 0 {
@@ -528,6 +556,7 @@ func keepaliveRawSpiceLoop(conn net.Conn, sohoToken, userID string, duration int
 			if ready, evidence := health.ready(); ready {
 				displayReady = true
 				logger.Infof("ZTE display session ready: %s", evidence)
+				diagnostics.Event("zte_display_ready", map[string]any{"evidence": evidence, "health": health.snapshot()})
 			} else if now.After(readinessDeadline) {
 				return fmt.Errorf("ZTE display readiness timeout: no MARK, SURFACE_CREATE, or DRAW_COPY after DISPLAY_INIT")
 			}
@@ -550,6 +579,20 @@ func keepaliveRawSpiceLoop(conn net.Conn, sohoToken, userID string, duration int
 			heartbeatCount++
 			logger.Infof("Raw SPICE heartbeat #%d (uptime=%ds)", heartbeatCount, elapsed)
 			nextHeartbeat = now.Add(25 * time.Second)
+		}
+		if !now.Before(nextHealthSnapshot) {
+			diagnostics.Event("zte_health_snapshot", map[string]any{
+				"uptimeSeconds":     elapsed,
+				"heartbeatCount":    heartbeatCount,
+				"heartbeatFailures": heartbeatFailures,
+				"mainMessages":      rawState.Messages,
+				"mainAckSent":       rawState.AckSent,
+				"mainLastMessageAt": rawState.LastMessageAt.Format(time.RFC3339Nano),
+				"displayReady":      displayReady,
+				"health":            health.snapshot(),
+				"runtime":           diagnostics.RuntimeSnapshot(),
+			})
+			nextHealthSnapshot = now.Add(time.Minute)
 		}
 
 		msgType, payload, err := rawState.ReadMessage(conn, 1*time.Second)
@@ -601,6 +644,7 @@ func keepaliveLoop(conn net.Conn, sohoToken, userID string, duration int) error 
 	heartbeatFailures := 0
 	ackStates := make(map[uint64]*scgAckState)
 	nextHeartbeat := start
+	nextHealthSnapshot := start
 
 	defer func() {
 		conn.Close()
@@ -647,6 +691,20 @@ func keepaliveLoop(conn net.Conn, sohoToken, userID string, duration int) error 
 				heartbeatCount, elapsed, result.SpiceOK, result.ConnectedChannels)
 			nextHeartbeat = now.Add(25 * time.Second)
 		}
+		if !now.Before(nextHealthSnapshot) {
+			channelState := make(map[string]any, len(ackStates))
+			for channel, state := range ackStates {
+				channelState[fmt.Sprintf("%d", channel)] = map[string]any{"window": state.window, "pending": state.pending}
+			}
+			diagnostics.Event("scg_health_snapshot", map[string]any{
+				"uptimeSeconds":     elapsed,
+				"heartbeatCount":    heartbeatCount,
+				"heartbeatFailures": heartbeatFailures,
+				"channels":          channelState,
+				"runtime":           diagnostics.RuntimeSnapshot(),
+			})
+			nextHealthSnapshot = now.Add(time.Minute)
+		}
 
 		frame, err := chuanyun.RecvTrunkFrame(conn, time.Second)
 		if err != nil {
@@ -667,12 +725,14 @@ type scgAckState struct {
 }
 
 func handleSCGFrame(conn net.Conn, sid uint64, frame *chuanyun.Frame, ackStates map[uint64]*scgAckState) error {
+	diagnostics.Packet("rx", "scg-chuanyun", fmt.Sprintf("channel-%d", frame.Field2), uint64(frame.PktType), frame.Payload)
 	if frame.PktType == chuanyun.TrunkSwitch && len(frame.Payload) >= 32 {
 		senderCID := binary.LittleEndian.Uint64(frame.Payload[8:16])
 		param := binary.LittleEndian.Uint32(frame.Payload[16:20])
 		switchReason := frame.Payload[20]
 		extraID := binary.LittleEndian.Uint64(frame.Payload[24:32])
 		resp := chuanyun.TrunkSwitchPack(senderCID, sid, param, switchReason, extraID, frame.Field1, frame.Field2)
+		diagnostics.Packet("tx", "scg-chuanyun", fmt.Sprintf("channel-%d", frame.Field2), uint64(chuanyun.TrunkSwitch), resp)
 		if _, err := conn.Write(resp); err != nil {
 			return fmt.Errorf("send SCG trunk switch reply: %w", err)
 		}
@@ -702,6 +762,7 @@ func handleSCGFrame(conn net.Conn, sid uint64, frame *chuanyun.Frame, ackStates 
 		binary.LittleEndian.PutUint32(pong[2:6], uint32(len(pingData)))
 		copy(pong[6:], pingData)
 		head := chuanyun.FrameHeadPack(spice.DataType, uint16(len(pong)), sid, frame.Field2)
+		diagnostics.Packet("tx", "scg-spice", chName, 0x03, pong[6:])
 		if _, err := conn.Write(append(head, pong...)); err != nil {
 			return fmt.Errorf("send SCG PONG on %s: %w", chName, err)
 		}
@@ -720,6 +781,7 @@ func handleSCGFrame(conn net.Conn, sid uint64, frame *chuanyun.Frame, ackStates 
 		binary.LittleEndian.PutUint32(ackSync[2:6], 4)
 		binary.LittleEndian.PutUint32(ackSync[6:10], generation)
 		head := chuanyun.FrameHeadPack(spice.DataType, uint16(len(ackSync)), sid, frame.Field2)
+		diagnostics.Packet("tx", "scg-spice", chName, 0x01, ackSync[6:])
 		if _, err := conn.Write(append(head, ackSync...)); err != nil {
 			return fmt.Errorf("send SCG ACK_SYNC on %s: %w", chName, err)
 		}
@@ -733,6 +795,7 @@ func handleSCGFrame(conn net.Conn, sid uint64, frame *chuanyun.Frame, ackStates 
 			ack := make([]byte, 6)
 			binary.LittleEndian.PutUint16(ack[0:2], 0x02)
 			head := chuanyun.FrameHeadPack(spice.DataType, uint16(len(ack)), sid, frame.Field2)
+			diagnostics.Packet("tx", "scg-spice", chName, 0x02, nil)
 			if _, err := conn.Write(append(head, ack...)); err != nil {
 				return fmt.Errorf("send SCG ACK on %s: %w", chName, err)
 			}
@@ -784,12 +847,15 @@ func sendSohoHeartbeat(sohoToken, userID string) error {
 	}
 	result, err := soho.SohoRequest("/cc/cloudPc/heartbeat/v2", bodyData, sohoToken, userID)
 	if err != nil {
+		diagnostics.Event("soho_heartbeat", map[string]any{"ok": false, "error": err.Error()})
 		return err
 	}
 	code := jsonString(result["code"])
 	if code != "2000" && code != "4041" {
+		diagnostics.Event("soho_heartbeat", map[string]any{"ok": false, "code": code, "message": fmt.Sprint(result["msg"])})
 		return fmt.Errorf("heartbeat rejected: code=%s msg=%v", code, result["msg"])
 	}
+	diagnostics.Event("soho_heartbeat", map[string]any{"ok": true, "code": code})
 	return nil
 }
 

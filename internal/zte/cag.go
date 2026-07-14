@@ -1,6 +1,7 @@
 package zte
 
 import (
+	"cloud-computer-keepalive/internal/diagnostics"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -68,6 +69,7 @@ func DialCAGKCP(ctx context.Context, opts CAGDialOptions) (net.Conn, *CAGSession
 	if err != nil {
 		return nil, nil, err
 	}
+	diagnostics.Packet("tx", "zte-cag-udp-auth", "outer", 0x06, first)
 	if _, err := udpConn.WriteToUDP(first, remote); err != nil {
 		return nil, nil, err
 	}
@@ -76,6 +78,7 @@ func DialCAGKCP(ctx context.Context, opts CAGDialOptions) (net.Conn, *CAGSession
 	if err != nil {
 		return nil, nil, fmt.Errorf("wait CAG auth head ack: %w", err)
 	}
+	diagnostics.Packet("rx", "zte-cag-udp-auth", "outer", 0x07, headAck)
 	replySynID, conv, err := parseCAGAuthHeader(headAck)
 	if err != nil {
 		return nil, nil, err
@@ -88,20 +91,26 @@ func DialCAGKCP(ctx context.Context, opts CAGDialOptions) (net.Conn, *CAGSession
 	if err != nil {
 		return nil, nil, err
 	}
+	diagnostics.Packet("tx", "zte-cag-udp-auth", "outer", 0x08, second)
 	if _, err := udpConn.WriteToUDP(second, remote); err != nil {
 		return nil, nil, err
 	}
-	if _, err := readCAGPacket(ctx, udpConn, remote, 0x09); err != nil {
+	authAck, err := readCAGPacket(ctx, udpConn, remote, 0x09)
+	if err != nil {
 		return nil, nil, fmt.Errorf("wait CAG auth ack: %w", err)
 	}
+	diagnostics.Packet("rx", "zte-cag-udp-auth", "outer", 0x09, authAck)
 
 	third := buildCAGSynPacket(synID, conv)
+	diagnostics.Packet("tx", "zte-cag-udp-auth", "outer", 0x01, third)
 	if _, err := udpConn.WriteToUDP(third, remote); err != nil {
 		return nil, nil, err
 	}
-	if _, err := readCAGPacket(ctx, udpConn, remote, 0x02); err != nil {
+	synAck, err := readCAGPacket(ctx, udpConn, remote, 0x02)
+	if err != nil {
 		return nil, nil, fmt.Errorf("wait CAG syn ack: %w", err)
 	}
+	diagnostics.Packet("rx", "zte-cag-udp-auth", "outer", 0x02, synAck)
 	_ = udpConn.SetDeadline(time.Time{})
 
 	packetConn := newCAGPacketConn(udpConn, os.Getenv("CCK_ZTE_CAG_TRACE_DIR"))

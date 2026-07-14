@@ -1,6 +1,7 @@
 package zte
 
 import (
+	"cloud-computer-keepalive/internal/diagnostics"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -50,6 +51,7 @@ func DialCAGTCPTLS(ctx context.Context, opts CAGDialOptions) (net.Conn, *CAGSess
 		return nil, nil, err
 	}
 	first := firstUDP[21:]
+	diagnostics.Packet("tx", "zte-cag-tcp-auth", "outer", 0x06, first)
 	if _, err := conn.Write(first); err != nil {
 		return nil, nil, fmt.Errorf("send CAG TCP local-key: %w", err)
 	}
@@ -57,6 +59,7 @@ func DialCAGTCPTLS(ctx context.Context, opts CAGDialOptions) (net.Conn, *CAGSess
 	if err != nil {
 		return nil, nil, fmt.Errorf("read CAG TCP local-key ack: %w", err)
 	}
+	diagnostics.Packet("rx", "zte-cag-tcp-auth", "outer", 0x07, headAck)
 	if len(headAck) < 50 || string(headAck[:4]) != "ZTEC" {
 		return nil, nil, fmt.Errorf("invalid CAG TCP local-key ack")
 	}
@@ -66,6 +69,7 @@ func DialCAGTCPTLS(ctx context.Context, opts CAGDialOptions) (net.Conn, *CAGSess
 	if err != nil {
 		return nil, nil, err
 	}
+	diagnostics.Packet("tx", "zte-cag-tcp-auth", "outer", 0x08, second)
 	if _, err := conn.Write(second); err != nil {
 		return nil, nil, fmt.Errorf("send CAG TCP auth: %w", err)
 	}
@@ -73,6 +77,7 @@ func DialCAGTCPTLS(ctx context.Context, opts CAGDialOptions) (net.Conn, *CAGSess
 	if err != nil {
 		return nil, nil, fmt.Errorf("read CAG TCP auth ack: %w", err)
 	}
+	diagnostics.Packet("rx", "zte-cag-tcp-auth", "outer", 0x09, authAck)
 	if len(authAck) < 8 || authAck[4] != 0x01 {
 		prefixLen := 16
 		if len(authAck) < prefixLen {

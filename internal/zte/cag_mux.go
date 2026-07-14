@@ -1,6 +1,7 @@
 package zte
 
 import (
+	"cloud-computer-keepalive/internal/diagnostics"
 	"cloud-computer-keepalive/internal/logger"
 	"context"
 	"encoding/binary"
@@ -102,6 +103,9 @@ func OpenCAGMuxLinkWithTrace(ctx context.Context, mux *CAGMux, params *ConnectPa
 func (m *CAGMux) writePacket(packet []byte) (int, error) {
 	m.writeM.Lock()
 	defer m.writeM.Unlock()
+	if len(packet) >= 2 {
+		diagnostics.Packet("tx", "zte-cag-mux", fmt.Sprintf("link-%d", packet[1]), uint64(packet[0]), packet)
+	}
 	return m.conn.Write(packet)
 }
 
@@ -109,6 +113,7 @@ func (m *CAGMux) readLoop() {
 	for {
 		head := make([]byte, 4)
 		if _, err := io.ReadFull(m.conn, head); err != nil {
+			diagnostics.Event("zte_cag_mux_read_error", map[string]any{"stage": "header", "error": err.Error()})
 			m.broadcast(cagMuxFrame{err: err})
 			return
 		}
@@ -118,10 +123,13 @@ func (m *CAGMux) readLoop() {
 		payload := make([]byte, n)
 		if n > 0 {
 			if _, err := io.ReadFull(m.conn, payload); err != nil {
+				diagnostics.Event("zte_cag_mux_read_error", map[string]any{"stage": "payload", "link": linkID, "cmd": cmd, "error": err.Error()})
 				m.broadcast(cagMuxFrame{err: err})
 				return
 			}
 		}
+		packet := append(append([]byte(nil), head...), payload...)
+		diagnostics.Packet("rx", "zte-cag-mux", fmt.Sprintf("link-%d", linkID), uint64(cmd), packet)
 		logger.Debugf("ZTE CAG mux recv cmd=0x%02x link=%d len=%d", cmd, linkID, n)
 		m.linksM.RLock()
 		link := m.links[linkID]

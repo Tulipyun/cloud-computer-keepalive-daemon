@@ -6,6 +6,8 @@
 
 当前开发中的协议硬化版本见 [V0.2_HARDENING.md](V0.2_HARDENING.md)。已发布的 `v0.1.0` 保持冻结，可随时作为回退基线。
 
+用于无人值守长测的临时诊断版本说明见 [LONGTEST_GUIDE.md](LONGTEST_GUIDE.md)。
+
 ## 当前能力
 
 - 子账号密码登录，不依赖主账号手机号。

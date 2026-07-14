@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"cloud-computer-keepalive/internal/config"
 	"cloud-computer-keepalive/internal/crypto"
+	"cloud-computer-keepalive/internal/diagnostics"
 	"cloud-computer-keepalive/internal/logger"
 	"cloud-computer-keepalive/internal/soho"
 	"fmt"
@@ -17,6 +18,26 @@ import (
 )
 
 func RunDaemon() {
+	session, diagErr := diagnostics.Start("")
+	if diagErr != nil {
+		logger.Warnf("Diagnostic logging unavailable: %v", diagErr)
+	} else {
+		defer diagnostics.Close()
+		if err := logger.ConfigureFile(session.RuntimeLog, logger.DEBUG); err != nil {
+			logger.Warnf("Runtime file logging unavailable: %v", err)
+		} else {
+			defer logger.CloseFile()
+		}
+		logger.Infof("Diagnostic session directory: %s", session.Dir)
+		logger.Warn("Diagnostic logs may contain private network and protocol data; do not publish them")
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			path := diagnostics.Incident(fmt.Errorf("panic: %v", recovered), map[string]any{"panic": true})
+			logger.Errorf("Fatal panic captured in incident: %s", path)
+			panic(recovered)
+		}
+	}()
 	scanner := bufio.NewScanner(os.Stdin)
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -40,14 +61,23 @@ func RunDaemon() {
 		}
 		decision := classifyKeepaliveError(err)
 		failures[decision.kind]++
+		incidentPath := diagnostics.Incident(err, map[string]any{
+			"failureKind": decision.kind,
+			"consecutive": failures[decision.kind],
+			"runSeconds":  int(time.Since(started).Seconds()),
+		})
 		logger.Warnf("Keepalive stopped: kind=%s consecutive=%d reason=%s error=%v",
 			decision.kind, failures[decision.kind], decision.description, err)
+		if incidentPath != "" {
+			logger.Warnf("Incident snapshot saved: %s", incidentPath)
+		}
 		if decision.fatal {
 			logger.Errorf("Automatic retry stopped: %s", decision.description)
 			return
 		}
 
 		if decision.relogin {
+			diagnostics.Event("login_refresh_started", map[string]any{"failureKind": decision.kind})
 			if loginErr := ensureLocalConfig(scanner, cfg, true); loginErr != nil {
 				loginDecision := classifyKeepaliveError(loginErr)
 				failures[loginDecision.kind]++
@@ -58,10 +88,17 @@ func RunDaemon() {
 				}
 			} else {
 				failures[failureAuth] = 0
+				diagnostics.Event("login_refresh_succeeded", map[string]any{})
 			}
 		}
 
 		delay := retryDelay(decision, failures[decision.kind])
+		diagnostics.Event("retry_scheduled", map[string]any{
+			"failureKind":  decision.kind,
+			"consecutive":  failures[decision.kind],
+			"delaySeconds": delay.Seconds(),
+			"relogin":      decision.relogin,
+		})
 		logger.Infof("Retrying in %s (kind=%s)...", delay.Round(time.Second), decision.kind)
 		if !waitForRetry(delay) {
 			logger.Info("User interrupted during retry wait")
