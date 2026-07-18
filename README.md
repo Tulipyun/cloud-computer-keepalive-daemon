@@ -1,105 +1,84 @@
 # Cloud Computer Keepalive Daemon
 
-这是一个面向中国移动云电脑子账号场景的长期保活客户端。当前版本以纯 Go 实现已验证的 SOHO、ZTE CAG/VMC 和 SPICE 连接流程，不依赖官方 Windows 客户端或原生 SDK，可编译为 Windows x64、Windows ARM64 和 Linux x64 程序。
+面向中国移动云电脑子账号场景的纯 Go 长期保活客户端。当前 `v0.2.0` 已实现 SOHO 登录、ZTE VMC/CAG、CAG mux 和 SPICE 会话，不依赖官方 Windows 客户端或原生 SDK，可交叉编译为 Windows x64、Windows ARM64 和 Linux x64。
 
-本仓库是后续协议维护和无人值守运行的私有起点。协议状态、关键结论和升级入口另见 [LOCAL_DAEMON_STATUS.md](LOCAL_DAEMON_STATUS.md)。
+本仓库为私有维护基线。运行配置、账号、令牌、原始抓包和诊断日志不得提交或发布。
 
-当前开发中的协议硬化版本见 [V0.2_HARDENING.md](V0.2_HARDENING.md)。已发布的 `v0.1.0` 保持冻结，可随时作为回退基线。
+## 版本与分支
+
+- `main` / `v0.2.0`：普通长期运行版，作为后续开发默认起点。
+- `codex/v0.2-longtest-diagnostics` / `v0.2.0-longtest-1`：完整日志版源码，用于协议变化和长时间故障取证。
+- `v0.1.0`：最初可用的冻结回退版本。
+
+两个 `v0.2` 变体使用相同的登录、ZTE、CAG、SPICE 和重试实现。日志版额外记录轮转日志、结构化事件、数据包摘要和 incident 快照。
 
 ## 当前能力
 
 - 子账号密码登录，不依赖主账号手机号。
-- 自动查询云电脑并获取 ZTE firm auth 参数。
-- 通过 ZTE VMC 启动桌面。
-- 优先建立 CAG TCP/TLS 连接，失败时回退到 UDP/KCP。
-- 完成 CAG mux、SPICE 主通道和子通道认证。
-- 同时维持 SOHO heartbeat 与 SPICE 协议级保活。
-- 连接意外中断后自动刷新登录并指数退避重试。
-- 首次配置后无需命令行参数，启动程序即进入长期保活。
+- 自动查询云电脑并取得 `getFirmAuth` 返回的 ZTE 参数。
+- 调用 ZTE VMC `sysConfig/getToken/getDesktopList/startDesktop`。
+- 优先建立 CAG TCP/TLS，失败时回退到 UDP/KCP。
+- 建立 CAG mux、SPICE 主通道和 7 个子通道。
+- 处理 PING/PONG、SET_ACK/ACK_SYNC/ACK 和 ZTE `0x74 -> 0x79`。
+- 使用 MARK、SURFACE_CREATE 或 DRAW_COPY 判断显示会话就绪。
+- 同时维持 SOHO heartbeat 和 SPICE 协议活动。
+- 按认证、维护、网络、协议和本地配置分类执行重试。
+- 将子账号密码以机器绑定的 AES-GCM 密文保存到当前目录 `config.json`。
 
 ## 快速开始
 
-1. 从私有仓库的 Releases 下载对应平台二进制。
-2. 将程序放入一个固定目录，并从该目录启动。
-3. 首次运行时输入子账号和密码；如果账号下有多台云电脑，再选择目标云电脑。
-4. 程序会在当前工作目录生成 `config.json`，随后直接进入长期保活。
-5. 后续从同一目录、同一系统用户启动时，会读取配置并自动连接。
+1. 从私有 Release 下载对应平台的普通版二进制。
+2. 将程序放入固定目录并从该目录启动。
+3. 首次运行输入子账号和密码；存在多台云电脑时选择目标设备。
+4. 程序生成 `config.json` 后立即进入长期保活。
+5. 后续在同一机器、同一系统用户和同一工作目录启动时自动读取配置。
 
-程序不再提供 `login`、`keepalive`、`--duration` 或 `--forever` 等命令行模式。按 `Ctrl+C` 可正常停止。
+程序不需要子命令或运行参数。按 `Ctrl+C` 正常停止。
 
-## 配置与密码
+## 安全说明
 
-运行配置保存在当前工作目录的 `config.json`，该文件已被 Git 忽略，不应提交。
+`config.json` 中的 `sub_password_box` 使用 scrypt 派生本机密钥并通过 AES-GCM 加密。密钥材料包含操作系统、主机名、当前用户名和随机 salt，因此配置通常不能直接迁移到其他机器或系统用户。
 
-密码不会以明文写入配置。程序使用 scrypt 派生本机绑定密钥，并通过 AES-GCM 保存为 `sub_password_box`。密钥材料包含操作系统、主机名、当前用户名和随机 salt，因此配置通常只能由同一机器上的同一系统用户自动解密。
+这种机制用于避免密码明文落盘，但不等同于 DPAPI、Credential Manager、Secret Service 或硬件密钥库。能够以同一系统用户执行任意代码的本地攻击者仍可能取得凭据。
 
-这一机制的目标是避免密码明文落盘，不等同于 Windows Credential Manager、DPAPI、Linux Secret Service 或硬件密钥库。能够以同一系统用户执行任意代码的本地攻击者仍可能取得凭据。复制配置到其他机器或切换系统用户后，程序可能要求重新输入密码。
+以下内容不得上传：
 
-`config.json`、旧版 `cloud_pc.json`、抓包、token、账号资料和调试环境不得上传到仓库或 Release。
+- `config.json`、`cloud_pc.json`
+- 账号、密码、token、VM 凭据和私有端点
+- `logs/`、原始抓包、incident 和本地探针输出
 
-## 自动恢复策略
+## 技术文档
 
-连接异常结束后，daemon 会尝试刷新子账号登录状态，然后重新执行完整连接流程。重试从 5 秒开始指数增长，最大为 5 分钟。如果上一次连接已稳定运行超过 10 分钟，退避会重置为 5 秒。
-
-正常的持续链路包括：
-
-```text
-SOHO login/list/getFirmAuth
-  -> ZTE VMC getToken/getDesktopList/startDesktop
-  -> ZTE CAG TCP/TLS (or UDP/KCP fallback)
-  -> CAG mux proxy links
-  -> SPICE main/subchannel authentication
-  -> SOHO heartbeat + SPICE auto-replies
-```
-
-## 已验证的协议要点
-
-- 子账号登录路径是 SOHO home sub-account password login。
-- 子账号 `getFirmAuth` 返回 ZTE VMC/CAG 参数，而不是原始 SCG 流程使用的 `scAuthCode`。
-- 长连接期间，服务端 SPICE 消息 `0x74` 需要客户端回复 `0x79`，消息体为 1 字节 `0x00`。
-- `0x75` 与断开流程相关，不应作为 `0x74` 的保活回复。
+- [PROJECT_STATE.md](PROJECT_STATE.md)：当前项目状态和新对话交接入口。
+- [docs/PROTOCOL_IMPLEMENTATION.md](docs/PROTOCOL_IMPLEMENTATION.md)：完整技术路径、关键参数和实现方法。
+- [docs/SOAK_TEST_20260714.md](docs/SOAK_TEST_20260714.md)：96 小时长时间测试结果。
+- [docs/BUILD_AND_RELEASE.md](docs/BUILD_AND_RELEASE.md)：普通版、日志版构建和发布流程。
+- [V0.2_HARDENING.md](V0.2_HARDENING.md)：协议硬化内容。
+- [LONGTEST_GUIDE.md](LONGTEST_GUIDE.md)：完整日志版使用和日志收集方法。
 
 ## 从源码构建
 
-需要 Go 1.24 或兼容版本。
+需要 Go 1.24 或兼容版本。三个目标均使用 `CGO_ENABLED=0`。
 
 ```powershell
 go test ./...
-
-$env:CGO_ENABLED = "0"
-$env:GOOS = "windows"
-$env:GOARCH = "amd64"
-go build -trimpath -ldflags="-s -w" -o dist\cck-daemon-windows-amd64.exe .
-
-$env:GOARCH = "arm64"
-go build -trimpath -ldflags="-s -w" -o dist\cck-daemon-windows-arm64.exe .
-
-$env:GOOS = "linux"
-$env:GOARCH = "amd64"
-go build -trimpath -ldflags="-s -w" -o dist\cck-daemon-linux-amd64 .
+.\scripts\build-release.ps1 -Variant standard -Version v0.2.0
 ```
 
-三个目标均使用 `CGO_ENABLED=0`，不需要随程序分发 C 运行库或官方 SDK。
+日志版需要先检出对应诊断分支：
 
-## 目录结构
+```powershell
+git switch codex/v0.2-longtest-diagnostics
+go test ./...
+.\scripts\build-release.ps1 -Variant longtest -Version v0.2.0
+```
 
-- `main.go`：长期运行入口。
-- `cmd/daemon.go`：首次配置、登录刷新和重试调度。
-- `cmd/keepalive.go`：SCG/ZTE 保活流程。
-- `internal/soho/`：SOHO 登录和 API 请求。
-- `internal/zte/`：ZTE VMC、CAG、mux 和认证实现。
-- `internal/spice/`：SPICE 握手与协议消息处理。
-- `internal/config/`：运行配置和本机绑定密码加密。
-- `LOCAL_DAEMON_STATUS.md`：当前实现状态、构建校验值和未来升级提示。
+产物和 SHA256 清单位于 `dist/release-v0.2.0-<variant>/`。
 
-## 调试与升级
+## 重要结论
 
-协议变化时，优先检查 `cmd/keepalive.go`、`internal/zte/` 和 `internal/spice/raw.go`。本地工作区可保留被 Git 忽略的 `native_probe/` 抓包与探测工具，但其中可能包含敏感连接资料，不能上传。
-
-每次正式更新建议：
-
-1. 运行 `go test ./...`。
-2. 至少进行一次 150 秒以上的实际子账号连接测试。
-3. 重新构建三个目标平台。
-4. 记录 SHA256。
-5. 通过新的 Git tag 和私有 Release 发布二进制。
+- 子账号 `getFirmAuth` 返回 ZTE VMC/CAG 参数，而不是原始 SCG 路径使用的 `scAuthCode`。
+- ZTE 长连接不能只发送 SOHO heartbeat，还必须维持 CAG/SPICE 会话和各通道自动应答。
+- `0x74` 必须回复 `0x79`，消息体为单字节 `0x00`。
+- `0x75` 与断开流程有关，不能用作 `0x74` 的回复。
+- 不应定期重发 DISPLAY_INIT/INPUT_INIT，也未启用未经抓包确认的合成 21 Hz display 流量。
