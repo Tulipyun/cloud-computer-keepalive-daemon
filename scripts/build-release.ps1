@@ -29,7 +29,7 @@ try {
         $env:GOARCH = $target.GOARCH
         $name = "{0}-{1}-{2}" -f $prefix, $Version, $target.Suffix
         $path = Join-Path $output $name
-        & go build -trimpath -ldflags '-s -w' -o $path $repo
+        & go build -buildvcs=false -trimpath -ldflags '-s -w' -o $path $repo
         if ($LASTEXITCODE -ne 0) {
             throw "go build failed for $($target.GOOS)/$($target.GOARCH)"
         }
