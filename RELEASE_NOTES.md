@@ -1,31 +1,55 @@
-# v0.1.0 - Private daemon baseline
+# v0.2.0 - Protocol-hardened private baseline
 
-Date: 2026-07-14
+Date: 2026-07-18
 
-This release establishes the first private baseline for future development.
+This release replaces the initial `v0.1.0` private baseline with the protocol-hardened implementation validated by a continuous four-day ZTE/SPICE session.
 
 ## Included
 
-- Pure Go sub-account password login.
-- Pure Go ZTE VMC/CAG connection and desktop startup.
+- Pure Go sub-account password login and unattended configuration flow.
+- ZTE VMC desktop startup and decoded `connectStr` handling.
 - CAG TCP/TLS with UDP/KCP fallback.
-- Raw SPICE main and subchannel setup.
-- SOHO heartbeat and SPICE protocol auto-replies.
-- Persistent no-argument daemon entry point.
+- CAG mux main link and seven authenticated SPICE subchannels.
+- SPICE SET_ACK generation/window handling, ACK_SYNC, normal ACK and PING/PONG.
+- ZTE `0x74 -> 0x79` long-session reply.
+- Display readiness based on MARK, SURFACE_CREATE or DRAW_COPY evidence.
+- Display channel closure propagation to the owning session.
+- SOHO heartbeat business-code validation and three-failure threshold.
+- Classified retry policy with jitter, re-login and stable-session counter reset.
 - Machine-bound encrypted password storage in `config.json`.
-- Automatic login refresh and reconnect backoff.
+- Optional long-test diagnostic source branch and binaries.
 
-## Binaries
+## Release assets
 
-- Windows x64: `cck-daemon-windows-amd64.exe`
-- Windows ARM64: `cck-daemon-windows-arm64.exe`
-- Linux x64: `cck-daemon-linux-amd64`
+Standard binaries:
+
+- `cck-daemon-v0.2.0-windows-amd64.exe`
+- `cck-daemon-v0.2.0-windows-arm64.exe`
+- `cck-daemon-v0.2.0-linux-amd64`
+
+Diagnostic binaries:
+
+- `cck-longtest-v0.2.0-windows-amd64.exe`
+- `cck-longtest-v0.2.0-windows-arm64.exe`
+- `cck-longtest-v0.2.0-linux-amd64`
+
+The release also contains SHA256 manifests and a source archive for the diagnostic tag.
 
 ## Verification
 
-- `go test ./...`
-- Cross-compilation with `CGO_ENABLED=0`
-- Previously verified live sub-account ZTE/SPICE session beyond 150 seconds
+- `go test ./...`: passed on both source variants.
+- Formal source packages: `go vet` passed.
+- Cross-compilation: Windows amd64, Windows arm64 and Linux amd64 passed with `CGO_ENABLED=0`.
+- Live ZTE authentication: 7/7 SPICE subchannels.
+- Display readiness: MARK and SURFACE_CREATE observed on display link 7.
+- Soak test: 96 hours 6 minutes in one session without reconnect.
+- Packet diagnostics: sequence `1..915895` with no gaps.
+- Main-channel keepalive: 34,598 `0x74 -> 0x79` exchanges.
+- Runtime: stable goroutine and memory counts; no incident or protocol failure.
 
-Runtime configuration, credentials, tokens, captures, and local probe data are not included.
+## Deferred
+
+Two isolated SOHO HTTP timeouts occurred during the soak test and recovered immediately. Decoupling SOHO HTTP heartbeat from the raw SPICE main loop remains a possible future hardening change, but is intentionally not included in this frozen release.
+
+Runtime configuration, credentials, tokens, captures, raw diagnostic logs and local probe data are not included.
 
