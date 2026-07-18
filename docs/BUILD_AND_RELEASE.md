@@ -63,7 +63,7 @@ Each command produces:
 - `SHA256SUMS.txt`
 - `BUILD_INFO.txt`
 
-All targets use `CGO_ENABLED=0`, `-trimpath` and linker flags `-s -w`.
+All targets use `CGO_ENABLED=0`, `-buildvcs=false`, `-trimpath` and linker flags `-s -w`. The exact source commit remains recorded in `BUILD_INFO.txt` without making documentation-only commits change the executable bytes.
 
 ## Source archive
 
