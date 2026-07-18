@@ -31,6 +31,8 @@ dist/
 # Runtime config
 cloud_pc.json
 config.json
+logs/
+longtest-logs-*.zip
 
 # env file
 .env
