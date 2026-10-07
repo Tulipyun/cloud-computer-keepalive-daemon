@@ -34,7 +34,7 @@ old marker scan as a fallback for the previous layout. Regression coverage lives
 `internal/spice/raw_maininit_test.go` and pins four recorded payloads (the 2026-07
 working capture plus the three 2026-10 failures).
 
-Verified live on 2026-10-07 against `117.172.15.3:8899`:
+Verified live on 2026-10-07 against the production CAG endpoint:
 
 - subchannel authentication `0/7` -> `5/7`
 - `ZTE display session ready: link=7 mark=true surface=true`
