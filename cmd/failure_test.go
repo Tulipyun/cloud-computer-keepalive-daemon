@@ -14,6 +14,10 @@ func TestClassifyKeepaliveError(t *testing.T) {
 		fatal   bool
 	}{
 		{"ZTE getToken failed: code=1000100 session invalid", failureAuth, true, false},
+		// Observed 2026-10: an expired SOHO token came back as code 4015 and was
+		// previously retried forever as an unclassified failure.
+		{"getFirmAuth failed: getFirmAuth failed: code=4015, msg=用户未登录，请先登录", failureAuth, true, false},
+		{"getFirmAuth failed: code=4015", failureAuth, true, false},
 		{"getFirmAuth failed: 503 service unavailable", failureMaintenance, false, false},
 		{"ZTE display readiness timeout", failureProtocol, false, false},
 		{"raw connection reset by peer", failureNetwork, false, false},

@@ -153,13 +153,48 @@ Message `0x75` was observed near disconnect handling and is not the reply to `0x
 
 All authenticated subchannels are continuously drained. A write failure, malformed frame, EOF or closure of all display channels ends the current session and enters classified retry handling.
 
+## Subchannel connection identifier
+
+Each subchannel REDQ carries a `connectionID` at payload offset `16..20`. It must be
+byte-identical to the identifier the server assigns to the main channel.
+
+The assignment is visible in the main-channel `MAIN_INIT` (`0x67`) payload as a
+little-endian `uint32` at offset `5..9`. `RawMainHandshake` reports it as
+`SpiceSessionID`, and `BuildZTERawChannelREDQ` writes it back into every subchannel
+REDQ unchanged.
+
+Do not compute this value from the RSA-key reply and do not re-encode it with a byte
+swap. The earlier implementation searched `MAIN_INIT` for a `02 00 00 00 01` anchor
+and read the four bytes preceding it; the 2026-10 server profile does not emit that
+anchor, and the fallback `payload[3:7]` produced a two-byte-shifted value that the
+server rejected. See `DIAGNOSIS_20261007.md` at the workspace root and the regression
+test in `internal/spice/raw_maininit_test.go`.
+
+## Subchannel acceptance on the current server profile
+
+| CAG link | SPICE channel type | Channel ID | Current server |
+| --- | --- | --- | --- |
+| 3 | 4 | 1 | closed with `0x2a` |
+| 2 | 6 | 0 | authenticated |
+| 4 | 5 | 0 | authenticated |
+| 6 | 3 | 0 | authenticated |
+| 7 | 2 | 0 | authenticated (display, MARK + SURFACE_CREATE) |
+| 8 | 4 | 0 | authenticated |
+| 5 | 2 | 1 | closed with `0x2a` |
+
+Links 3 and 5 carry `channelID=1`. The server closes them with a close-link frame
+before the client ticket is written. The remaining five links authenticate, display
+readiness is reached through link 7, and the session stays healthy. The same close
+frames are present in the 2026-07 recording, where the older client mis-counted them
+as successes.
+
 ## Retry model
 
 Implementation: `cmd/failure.go` and `cmd/daemon.go`.
 
 | Class | Typical cause | Action |
 | --- | --- | --- |
-| authentication | expired token, invalid session, login rejection | refresh login, short backoff |
+| authentication | expired token, invalid session, login rejection, SOHO code `4015` | refresh login, short backoff |
 | maintenance | platform maintenance, HTTP 502/503/504 | slower backoff, cap 5 minutes |
 | network | timeout, reset, EOF, dial failure | exponential backoff, cap 2 minutes |
 | protocol | malformed frame, readiness failure, missing required fields | separate backoff, cap 2 minutes |

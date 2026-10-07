@@ -41,6 +41,10 @@ func classifyKeepaliveError(err error) retryDecision {
 	if containsAny(text,
 		"1000100", "session invalid", "token expired", "unauthorized", "forbidden",
 		"login failed", "oauth/token failed", "missing token or user id", "invalid token",
+		// SOHO reports an expired or rejected token as business code 4015 with
+		// the message "用户未登录，请先登录". Without this entry a stale token is
+		// classified as unknown and retried forever instead of re-logging in.
+		"4015", "用户未登录", "not logged in",
 	) {
 		return retryDecision{failureAuth, true, false, 3 * time.Second, 30 * time.Second, "credentials or session must be refreshed"}
 	}
