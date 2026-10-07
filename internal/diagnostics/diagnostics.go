@@ -13,12 +13,16 @@ import (
 )
 
 const (
-	BuildLabel      = "v0.2.0-longtest-1"
 	maxJournalBytes = 64 << 20
 	journalCopies   = 5
 	ringCapacity    = 512
 	incidentDataMax = 8192
 )
+
+// BuildLabel identifies the diagnostic build in session.json. Release builds
+// override it with -ldflags so the recorded label matches the published asset
+// name instead of a hard-coded historical version.
+var BuildLabel = "v0.2.0-longtest-1"
 
 type Session struct {
 	Dir        string
