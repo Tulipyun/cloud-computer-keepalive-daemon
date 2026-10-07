@@ -2,7 +2,9 @@ param(
     [ValidateSet('standard', 'longtest')]
     [string]$Variant = 'standard',
     [string]$Version = 'v0.2.0',
-    # Restrict the build to a subset of targets, for example @('windows-amd64').
+    # Restrict the build to a subset of targets, for example
+    #   -Targets windows-amd64,windows-arm64
+    # CCK_BUILD_TARGETS is accepted as an environment fallback.
     [string[]]$Targets
 )
 
@@ -12,19 +14,30 @@ $output = Join-Path $repo ("dist\release-{0}-{1}" -f $Version, $Variant)
 New-Item -ItemType Directory -Force -Path $output | Out-Null
 
 $prefix = if ($Variant -eq 'longtest') { 'cck-longtest' } else { 'cck-daemon' }
-$allTargets = @(
-    @{ Name = 'windows-amd64'; GOOS = 'windows'; GOARCH = 'amd64'; Suffix = 'windows-amd64.exe' },
-    @{ Name = 'windows-arm64'; GOOS = 'windows'; GOARCH = 'arm64'; Suffix = 'windows-arm64.exe' },
-    @{ Name = 'linux-amd64';   GOOS = 'linux';   GOARCH = 'amd64'; Suffix = 'linux-amd64' }
-)
-$targets = if ($Targets) {
-    $allTargets | Where-Object { $Targets -contains $_.Name }
-} else {
-    $allTargets
+$knownTargets = 'windows-amd64', 'windows-arm64', 'linux-amd64'
+
+# Collect the requested target names from the parameter and the environment
+# fallback, splitting any comma-separated form and dropping empty pieces.
+$requested = @()
+foreach ($entry in @($Targets) + @($env:CCK_BUILD_TARGETS)) {
+    foreach ($piece in ("$entry" -split ',')) {
+        $trimmed = $piece.Trim()
+        if ($trimmed) { $requested += $trimmed }
+    }
 }
-if (-not $targets) {
-    throw "No build targets matched: $($Targets -join ', ')"
+if ($requested.Count -eq 0) {
+    $requested = $knownTargets
 }
+
+$selected = @()
+foreach ($name in $requested) {
+    if ($knownTargets -notcontains $name) {
+        throw "Unknown target '$name'. Available: $($knownTargets -join ', ')"
+    }
+    if ($selected -notcontains $name) { $selected += $name }
+}
+
+Write-Output ("Building {0} {1}: {2}" -f $Variant, $Version, ($selected -join ', '))
 
 # The standard variant has no diagnostics package, so only the longtest variant
 # receives an embedded build label.
@@ -35,20 +48,22 @@ if ($Variant -eq 'longtest') {
 
 $previous = @{
     CGO_ENABLED = $env:CGO_ENABLED
-    GOOS = $env:GOOS
-    GOARCH = $env:GOARCH
+    GOOS        = $env:GOOS
+    GOARCH      = $env:GOARCH
 }
 
 try {
     $env:CGO_ENABLED = '0'
-    foreach ($target in $targets) {
-        $env:GOOS = $target.GOOS
-        $env:GOARCH = $target.GOARCH
-        $name = "{0}-{1}-{2}" -f $prefix, $Version, $target.Suffix
-        $path = Join-Path $output $name
+    foreach ($name in $selected) {
+        $parts = $name -split '-'
+        $env:GOOS = $parts[0]
+        $env:GOARCH = $parts[1]
+        $outputName = "{0}-{1}-{2}" -f $prefix, $Version, $name
+        if ($env:GOOS -eq 'windows') { $outputName += '.exe' }
+        $path = Join-Path $output $outputName
         & go build -buildvcs=false -trimpath -ldflags $ldflags -o $path $repo
         if ($LASTEXITCODE -ne 0) {
-            throw "go build failed for $($target.GOOS)/$($target.GOARCH)"
+            throw "go build failed for $name"
         }
     }
 } finally {
@@ -73,7 +88,7 @@ $buildInfo = @(
     "variant=$Variant"
     "branch=$branch"
     "commit=$commit"
-    "targets=$(($targets | ForEach-Object { $_.Name }) -join ',')"
+    "targets=$($selected -join ',')"
     "ldflags=$ldflags"
     "go=$(& go version)"
     "cgo=0"
@@ -81,4 +96,4 @@ $buildInfo = @(
 )
 $buildInfo | Set-Content -LiteralPath (Join-Path $output 'BUILD_INFO.txt') -Encoding ascii
 
-Get-ChildItem -LiteralPath $output -File | Sort-Object Name | Select-Object Name, Length
+Get-ChildItem -LiteralPath $output -File | Sort-Object Name | ForEach-Object { "$($_.Length)`t$($_.Name)" }
