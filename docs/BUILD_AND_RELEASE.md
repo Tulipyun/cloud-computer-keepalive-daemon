@@ -126,3 +126,11 @@ The standard variant is built from `main`; the longtest variant is built from
 `codex/v0.2-longtest-diagnostics`. Both branches carry the subchannel session-ID fix, so
 the two variants differ only in diagnostic capture. The release notes should link to
 `PROJECT_STATE.md` and `docs/PROTOCOL_IMPLEMENTATION.md`.
+
+### v0.2.1 release notes caveat
+
+The release notes must state that CAG links 3 and 5 (`channelID=1`) are closed by the
+current server with a `0x2a` close-link frame, so the subchannel count reads `5/7`.
+The session still reaches display readiness through link 7 and stays connected; the
+same close frames are present in the 2026-07 recording, where the older counter
+mis-reported `7/7`. Do not advertise `7/7` for this release.
