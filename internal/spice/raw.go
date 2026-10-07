@@ -223,7 +223,26 @@ func derLength(der []byte) int {
 	return 2 + n + l
 }
 
+// zteMainInitConnectionID returns the SPICE connection/session identifier that
+// the server assigns to the main channel. Every authenticated subchannel REDQ
+// must echo this value in its connectionID field, otherwise the server closes
+// the subchannel with a 0x2a close-link frame and the session never becomes
+// healthy.
+//
+// The identifier is a little-endian uint32 at payload[5:9]. This holds for the
+// 2026-07 working capture and for the 2026-10 server profile (three independent
+// samples each). The older code located the field by searching for a
+// 02 00 00 00 01 marker immediately after it; that marker is absent from the
+// updated server's MAIN_INIT, so the lookup fell through to payload[3:7] and
+// returned a value shifted by two bytes (low half shifted into the high half,
+// padded with leading zeros). The server rejected every subchannel as a result.
+//
+// The marker scan is retained only as a fallback for any future server profile
+// that returns to the previous layout.
 func zteMainInitConnectionID(payload []byte) uint32 {
+	if len(payload) >= 9 {
+		return binary.LittleEndian.Uint32(payload[5:9])
+	}
 	marker := []byte{0x02, 0x00, 0x00, 0x00, 0x01}
 	if idx := bytes.Index(payload, marker); idx >= 4 {
 		return binary.LittleEndian.Uint32(payload[idx-4 : idx])
